@@ -1,0 +1,283 @@
+// This is your Prisma schema file
+// Learn more about it at https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// MULTI-TENANT CORE: Organization → Users → Projects
+// ─────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String   @db.VarChar(255)
+  slug      String   @unique @db.VarChar(100)
+  logo      String?  @db.Text
+  plan      OrgPlan  @default(FREE)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users         User[]
+  projects      Project[]
+  compareHistory CompareHistory[]
+  executionLogs  ExecutionLog[]
+  auditLogs      AuditLog[]
+
+  @@index([slug])
+  @@map("organizations")
+}
+
+enum OrgPlan {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+model User {
+  id             String    @id @default(uuid())
+  organizationId String
+  email          String    @unique @db.VarChar(255)
+  passwordHash   String    @db.Text
+  firstName      String    @db.VarChar(100)
+  lastName       String    @db.VarChar(100)
+  role           UserRole  @default(MEMBER)
+  avatar         String?   @db.Text
+  isActive       Boolean   @default(true)
+  emailVerified  Boolean   @default(false)
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  projects       Project[]
+  auditLogs      AuditLog[]
+  refreshTokens  RefreshToken[]
+
+  @@index([organizationId])
+  @@index([email])
+  @@map("users")
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique @db.VarChar(512)
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ─────────────────────────────────────────────
+// PROJECTS (Saved DB Connection Pairs)
+// ─────────────────────────────────────────────
+
+model Project {
+  id             String   @id @default(uuid())
+  organizationId String
+  createdById    String
+  projectName    String   @db.VarChar(255)
+  description    String?  @db.Text
+
+  // Source MSSQL Config
+  sourceHost             String  @db.VarChar(255)
+  sourcePort             Int     @default(1433)
+  sourceDatabase         String  @db.VarChar(255)
+  sourceUsername         String  @db.VarChar(255)
+  sourcePasswordEncrypted String  @db.Text
+  sourceEncryptConnection Boolean @default(false)
+  sourceTrustServerCert   Boolean @default(true)
+
+  // Destination MSSQL Config
+  destHost             String  @db.VarChar(255)
+  destPort             Int     @default(1433)
+  destDatabase         String  @db.VarChar(255)
+  destUsername         String  @db.VarChar(255)
+  destPasswordEncrypted String  @db.Text
+  destEncryptConnection Boolean @default(false)
+  destTrustServerCert   Boolean @default(true)
+
+  isArchived Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  organization   Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy      User             @relation(fields: [createdById], references: [id])
+  compareHistory CompareHistory[]
+  executionLogs  ExecutionLog[]
+
+  @@index([organizationId])
+  @@index([createdById])
+  @@map("projects")
+}
+
+// ─────────────────────────────────────────────
+// COMPARE HISTORY
+// ─────────────────────────────────────────────
+
+model CompareHistory {
+  id             String          @id @default(uuid())
+  organizationId String
+  projectId      String
+  status         CompareStatus   @default(RUNNING)
+  
+  // Summary Stats
+  tablesAdded       Int @default(0)
+  tablesModified    Int @default(0)
+  tablesMissing     Int @default(0)
+  viewsChanged      Int @default(0)
+  proceduresChanged Int @default(0)
+  functionsChanged  Int @default(0)
+  totalDifferences  Int @default(0)
+  
+  // Risk Level
+  riskLevel    RiskLevel @default(LOW)
+  
+  // The full comparison result JSON (compressed/summary)
+  resultSummary Json?
+  errorMessage  String?  @db.Text
+  
+  durationMs Int?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project       Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  executionLogs ExecutionLog[]
+
+  @@index([organizationId])
+  @@index([projectId])
+  @@map("compare_history")
+}
+
+enum CompareStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+// ─────────────────────────────────────────────
+// EXECUTION LOGS
+// ─────────────────────────────────────────────
+
+model ExecutionLog {
+  id              String           @id @default(uuid())
+  organizationId  String
+  projectId       String
+  compareHistoryId String?
+  
+  status          ExecutionStatus  @default(PENDING)
+  scriptSql       String           @db.LongText
+  riskLevel       RiskLevel        @default(LOW)
+  
+  totalBatches    Int              @default(0)
+  successBatches  Int              @default(0)
+  failedBatches   Int              @default(0)
+  
+  // Detailed execution logs (array of batch results as JSON)
+  batchLogs       Json?
+  errorMessage    String?          @db.Text
+  
+  durationMs      Int?
+  executedAt      DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  project         Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  compareHistory  CompareHistory?  @relation(fields: [compareHistoryId], references: [id])
+
+  @@index([organizationId])
+  @@index([projectId])
+  @@map("execution_logs")
+}
+
+enum ExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+// ─────────────────────────────────────────────
+// AUDIT TRAIL (Enterprise Compliance)
+// ─────────────────────────────────────────────
+
+model AuditLog {
+  id             String      @id @default(uuid())
+  organizationId String
+  userId         String?
+  
+  action         AuditAction
+  entity         String      @db.VarChar(100)  // e.g., "Project", "CompareHistory"
+  entityId       String?     @db.VarChar(100)
+  
+  description    String      @db.Text
+  metadata       Json?       // Additional context (IP, old values, new values)
+  ipAddress      String?     @db.VarChar(45)
+  userAgent      String?     @db.Text
+  
+  createdAt      DateTime    @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+enum AuditAction {
+  // Auth
+  USER_LOGIN
+  USER_LOGOUT
+  USER_REGISTER
+  
+  // Projects
+  PROJECT_CREATED
+  PROJECT_UPDATED
+  PROJECT_DELETED
+  PROJECT_ARCHIVED
+  
+  // Compare
+  COMPARE_STARTED
+  COMPARE_COMPLETED
+  COMPARE_FAILED
+  
+  // Execution
+  SCRIPT_EXECUTED
+  SCRIPT_FAILED
+  SCRIPT_EXPORTED
+  
+  // Admin
+  USER_INVITED
+  USER_ROLE_CHANGED
+  ORG_SETTINGS_UPDATED
+}

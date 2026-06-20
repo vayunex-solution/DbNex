@@ -1,0 +1,18 @@
+---
+deployment:
+  tasks:
+    # ── Backend Deployment ────────────────────────
+    # Deploys the Node.js + Express backend to api.dbnex.vayunexsolution.com
+    - export BACKEND_DEPLOYPATH=/home/vayunexs/api.dbnex.vayunexsolution.com
+    - mkdir -p $BACKEND_DEPLOYPATH
+    - rsync -amv --exclude='node_modules' --exclude='.env' backend/ $BACKEND_DEPLOYPATH/
+    - cd $BACKEND_DEPLOYPATH && npm install --production
+    - cd $BACKEND_DEPLOYPATH && npx prisma generate
+    - cd $BACKEND_DEPLOYPATH && npx prisma db push --accept-data-loss
+    - cd $BACKEND_DEPLOYPATH && node prisma/seed.js
+
+    # ── Frontend Deployment ───────────────────────
+    # Copies the pre-built frontend files (built locally and committed to Git) to dbnex.vayunexsolution.com
+    - export FRONTEND_DEPLOYPATH=/home/vayunexs/dbnex.vayunexsolution.com
+    - mkdir -p $FRONTEND_DEPLOYPATH
+    - rsync -amv frontend/dist/ $FRONTEND_DEPLOYPATH/
