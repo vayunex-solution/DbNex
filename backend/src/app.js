@@ -44,6 +44,9 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
+  // Required when behind a reverse proxy (cPanel LiteSpeed)
+  validate: { xForwardedForHeader: false },
+  skip: (req) => req.method === 'OPTIONS', // Skip CORS preflight
 });
 app.use('/api/', limiter);
 
