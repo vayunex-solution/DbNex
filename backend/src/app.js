@@ -23,6 +23,9 @@ const { notFound } = require('./middleware/notFound');
 
 const app = express();
 
+// Trust reverse proxy (required by express-rate-limit behind cPanel LiteSpeed)
+app.set('trust proxy', 1);
+
 // ── Security Headers ──────────────────────────
 app.use(helmet());
 
