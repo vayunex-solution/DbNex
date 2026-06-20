@@ -128,17 +128,52 @@ API:  http://localhost:5000
 
 ---
 
-## 🚀 cPanel Deployment
+## 🚀 cPanel Deployment (Git-based Setup)
 
-1. Upload the `dbnex` folder to your server
-2. Create MySQL database in cPanel
-3. Upload `.env` with production values
-4. Set Node.js app root to `backend/` in cPanel Node.js App Manager
-5. Set startup file to `src/app.js`
-6. Run `npm install` and `npx prisma migrate deploy`
-7. Build frontend: `npm run build` in `frontend/`
-8. Point domain to `frontend/dist/` as document root
-9. Configure reverse proxy for `/api` → `localhost:5000`
+DbNex uses an automated cPanel deployment workflow defined in `.cpanel.yml`:
+- **Frontend** is built **locally** (to keep cPanel lightweight and avoid node_modules compiling overhead). The compiled static files (`frontend/dist/`) are committed to Git.
+- **Backend** dependencies are installed directly on cPanel, Prisma Client is generated, and database schema is pushed.
+
+### Deployment Steps:
+
+1. **Configure local environment**:
+   - Create `frontend/.env.production` and set:
+     ```env
+     VITE_API_URL=https://api.dbnex.vayunexsolution.com
+     ```
+   - In `backend/.env`, set production MySQL credentials, JWT secrets, and AES encryption key.
+
+2. **Build frontend locally**:
+   ```bash
+   cd frontend
+   npm run build
+   ```
+   This generates compiled production files under `frontend/dist/`.
+
+3. **Commit & Push to GitHub**:
+   ```bash
+   git add .
+   git commit -m "chore: build frontend for deployment"
+   git push origin main
+   ```
+   *(Note: `frontend/dist/` is configured to be committed to Git so cPanel can deploy it directly).*
+
+4. **cPanel Auto Deployment**:
+   - Configure a **Git Version Control** repository in cPanel pointing to `https://github.com/vayunex-solution/DbNex.git`.
+   - cPanel will pull the repository and trigger `.cpanel.yml` to automatically:
+     1. Sync backend files to `/home/vayunexs/api.dbnex.vayunexsolution.com/`
+     2. Install backend production dependencies
+     3. Generate Prisma Client and run `npx prisma db push` (updates database schema without needing a shadow database)
+     4. Seed the database with the default owner account
+     5. Sync pre-built frontend files to `/home/vayunexs/dbnex.vayunexsolution.com/`
+
+5. **Start backend on cPanel**:
+   - Go to **Setup Node.js App** in cPanel.
+   - Set Application root to `/home/vayunexs/api.dbnex.vayunexsolution.com/`
+   - Set Application URL to `api.dbnex.vayunexsolution.com`
+   - Set Startup file to `src/app.js`
+   - Click **Run JS Script** or restart the app.
+
 
 ---
 
