@@ -1,4 +1,6 @@
-require('dotenv').config({ override: true });
+const path = require('path');
+require('dotenv').config({ override: true, path: path.join(__dirname, '../.env') });
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -6,7 +8,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 const logger = require('./utils/logger');
-const { prisma } = require('./config/database');
+const { testConnection, pool } = require('./config/database');
 
 // ── Route Imports ─────────────────────────────
 const authRoutes = require('./routes/auth.routes');
@@ -23,7 +25,7 @@ const { notFound } = require('./middleware/notFound');
 
 const app = express();
 
-// Trust reverse proxy (required by express-rate-limit behind cPanel LiteSpeed)
+// Trust reverse proxy (required behind cPanel LiteSpeed)
 app.set('trust proxy', 1);
 
 // ── Security Headers ──────────────────────────
@@ -44,9 +46,8 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
-  // Required when behind a reverse proxy (cPanel LiteSpeed)
   validate: { xForwardedForHeader: false },
-  skip: (req) => req.method === 'OPTIONS', // Skip CORS preflight
+  skip: (req) => req.method === 'OPTIONS',
 });
 app.use('/api/', limiter);
 
@@ -89,12 +90,8 @@ const PORT = process.env.PORT || 5000;
 
 async function startServer() {
   try {
-    await prisma.$connect();
-    logger.info('✅ MySQL database connected via Prisma');
-
-    // Warm up Prisma binary to avoid cold-start timeout on first request
-    await prisma.$queryRaw`SELECT 1`;
-    logger.info('✅ Prisma engine warmed up');
+    await testConnection();
+    logger.info('✅ MySQL database connected via mysql2');
 
     app.listen(PORT, () => {
       logger.info(`🚀 DbNex API running on port ${PORT}`);
@@ -111,13 +108,13 @@ async function startServer() {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM received. Shutting down gracefully...');
-  await prisma.$disconnect();
+  await pool.end();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   logger.info('SIGINT received. Shutting down gracefully...');
-  await prisma.$disconnect();
+  await pool.end();
   process.exit(0);
 });
 

@@ -1,30 +1,35 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate } = require('../middleware/auth.middleware');
-const { prisma } = require('../config/database');
+const { query } = require('../config/database');
 const AppError = require('../utils/AppError');
 
 router.use(authenticate);
 
-// Get all history (same as compare history endpoint but under /history)
 router.get('/', async (req, res, next) => {
   try {
     const { projectId, page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const where = { organizationId: req.organizationId };
-    if (projectId) where.projectId = projectId;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    const [records, total] = await Promise.all([
-      prisma.compareHistory.findMany({
-        where,
-        include: { project: { select: { projectName: true } } },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: parseInt(limit),
-      }),
-      prisma.compareHistory.count({ where }),
+    let whereClause = 'ch.organizationId = ?';
+    const params = [req.organizationId];
+
+    if (projectId) {
+      whereClause += ' AND ch.projectId = ?';
+      params.push(projectId);
+    }
+
+    const [records, countRows] = await Promise.all([
+      query(
+        `SELECT ch.*, p.projectName FROM compare_history ch
+         LEFT JOIN projects p ON ch.projectId = p.id
+         WHERE ${whereClause} ORDER BY ch.createdAt DESC LIMIT ? OFFSET ?`,
+        [...params, parseInt(limit), offset]
+      ),
+      query(`SELECT COUNT(*) as total FROM compare_history ch WHERE ${whereClause}`, params),
     ]);
 
+    const total = countRows[0].total;
     res.json({
       success: true,
       data: records,
@@ -37,12 +42,15 @@ router.get('/', async (req, res, next) => {
 
 router.get('/:id', async (req, res, next) => {
   try {
-    const record = await prisma.compareHistory.findFirst({
-      where: { id: req.params.id, organizationId: req.organizationId },
-      include: { project: { select: { projectName: true, sourceDatabase: true, destDatabase: true } } },
-    });
-    if (!record) return next(new AppError('History record not found.', 404));
-    res.json({ success: true, data: record });
+    const records = await query(
+      `SELECT ch.*, p.projectName, p.sourceDatabase, p.destDatabase
+       FROM compare_history ch
+       LEFT JOIN projects p ON ch.projectId = p.id
+       WHERE ch.id = ? AND ch.organizationId = ?`,
+      [req.params.id, req.organizationId]
+    );
+    if (!records[0]) return next(new AppError('History record not found.', 404));
+    res.json({ success: true, data: records[0] });
   } catch (error) {
     next(error);
   }

@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate, authorize } = require('../middleware/auth.middleware');
-const { prisma } = require('../config/database');
+const { query } = require('../config/database');
 
 router.use(authenticate);
 
@@ -14,7 +14,6 @@ router.get('/me', (req, res) => {
       name: org.name,
       slug: org.slug,
       plan: org.plan,
-      isActive: org.isActive,
     },
   });
 });
@@ -22,21 +21,21 @@ router.get('/me', (req, res) => {
 router.get('/stats', authorize('OWNER', 'ADMIN'), async (req, res, next) => {
   try {
     const orgId = req.organizationId;
-    const [
-      projectCount,
-      compareCount,
-      executionCount,
-      userCount,
-    ] = await Promise.all([
-      prisma.project.count({ where: { organizationId: orgId, isArchived: false } }),
-      prisma.compareHistory.count({ where: { organizationId: orgId } }),
-      prisma.executionLog.count({ where: { organizationId: orgId } }),
-      prisma.user.count({ where: { organizationId: orgId, isActive: true } }),
+    const [projectRows, compareRows, executionRows, userRows] = await Promise.all([
+      query('SELECT COUNT(*) as cnt FROM projects WHERE organizationId = ? AND isArchived = 0', [orgId]),
+      query('SELECT COUNT(*) as cnt FROM compare_history WHERE organizationId = ?', [orgId]),
+      query('SELECT COUNT(*) as cnt FROM execution_logs WHERE organizationId = ?', [orgId]),
+      query('SELECT COUNT(*) as cnt FROM users WHERE organizationId = ? AND isActive = 1', [orgId]),
     ]);
 
     res.json({
       success: true,
-      data: { projectCount, compareCount, executionCount, userCount },
+      data: {
+        projectCount: projectRows[0].cnt,
+        compareCount: compareRows[0].cnt,
+        executionCount: executionRows[0].cnt,
+        userCount: userRows[0].cnt,
+      },
     });
   } catch (error) {
     next(error);

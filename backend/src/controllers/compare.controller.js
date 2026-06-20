@@ -1,4 +1,5 @@
-const { prisma } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const { query, execute } = require('../config/database');
 const { decrypt } = require('../utils/encryption');
 const ExtractorService = require('../services/ExtractorService');
 const ComparatorService = require('../services/ComparatorService');
@@ -6,7 +7,6 @@ const AuditService = require('../services/AuditService');
 const AppError = require('../utils/AppError');
 
 exports.compareProject = async (req, res, next) => {
-  const compareHistoryId = null;
   let historyRecord;
   const startTime = Date.now();
 
@@ -14,30 +14,30 @@ exports.compareProject = async (req, res, next) => {
     const { projectId } = req.body;
     if (!projectId) return next(new AppError('projectId is required.', 400));
 
-    const project = await prisma.project.findFirst({
-      where: { id: projectId, organizationId: req.organizationId },
-    });
-    if (!project) return next(new AppError('Project not found.', 404));
+    const projects = await query(
+      'SELECT * FROM projects WHERE id = ? AND organizationId = ?',
+      [projectId, req.organizationId]
+    );
+    if (!projects[0]) return next(new AppError('Project not found.', 404));
+    const project = projects[0];
 
-    // Create a history record (RUNNING)
-    historyRecord = await prisma.compareHistory.create({
-      data: {
-        organizationId: req.organizationId,
-        projectId: project.id,
-        status: 'RUNNING',
-      },
-    });
+    const historyId = uuidv4();
+    const now = new Date();
+    await execute(
+      'INSERT INTO compare_history (id, organizationId, projectId, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+      [historyId, req.organizationId, project.id, 'RUNNING', now, now]
+    );
+    historyRecord = { id: historyId };
 
     await AuditService.log({
       organizationId: req.organizationId,
       userId: req.user.id,
       action: 'COMPARE_STARTED',
       entity: 'CompareHistory',
-      entityId: historyRecord.id,
+      entityId: historyId,
       description: `Comparison started for project "${project.projectName}"`,
     });
 
-    // Build connection configs (decrypt passwords)
     const sourceConfig = {
       host: project.sourceHost, port: project.sourcePort,
       database: project.sourceDatabase, username: project.sourceUsername,
@@ -53,60 +53,48 @@ exports.compareProject = async (req, res, next) => {
       trustServerCert: project.destTrustServerCert,
     };
 
-    // Extract both schemas in parallel
     const [sourceSchema, destSchema] = await Promise.all([
       ExtractorService.extractSchema(sourceConfig),
       ExtractorService.extractSchema(destConfig),
     ]);
 
-    // Compare
     const { summary, results } = ComparatorService.compare(sourceSchema, destSchema);
     const durationMs = Date.now() - startTime;
 
-    // Update history record (COMPLETED)
-    await prisma.compareHistory.update({
-      where: { id: historyRecord.id },
-      data: {
-        status: 'COMPLETED',
-        tablesAdded: summary.tablesAdded,
-        tablesModified: summary.tablesModified,
-        tablesMissing: summary.tablesMissing,
-        viewsChanged: summary.viewsChanged,
-        proceduresChanged: summary.proceduresChanged,
-        functionsChanged: summary.functionsChanged,
-        totalDifferences: summary.totalDifferences,
-        riskLevel: summary.overallRisk,
-        resultSummary: summary,
-        durationMs,
-      },
-    });
+    await execute(
+      `UPDATE compare_history SET
+        status = 'COMPLETED', tablesAdded = ?, tablesModified = ?, tablesMissing = ?,
+        viewsChanged = ?, proceduresChanged = ?, functionsChanged = ?,
+        totalDifferences = ?, riskLevel = ?, resultSummary = ?, durationMs = ?, updatedAt = NOW()
+       WHERE id = ?`,
+      [
+        summary.tablesAdded, summary.tablesModified, summary.tablesMissing,
+        summary.viewsChanged, summary.proceduresChanged, summary.functionsChanged,
+        summary.totalDifferences, summary.overallRisk,
+        JSON.stringify(summary), durationMs, historyId,
+      ]
+    );
 
     await AuditService.log({
       organizationId: req.organizationId,
       userId: req.user.id,
       action: 'COMPARE_COMPLETED',
       entity: 'CompareHistory',
-      entityId: historyRecord.id,
+      entityId: historyId,
       description: `Comparison completed for "${project.projectName}" — ${summary.totalDifferences} differences found (${summary.overallRisk} risk)`,
       metadata: { durationMs, summary },
     });
 
     res.json({
       success: true,
-      data: {
-        compareHistoryId: historyRecord.id,
-        summary,
-        results,
-        durationMs,
-      },
+      data: { compareHistoryId: historyId, summary, results, durationMs },
     });
   } catch (error) {
-    // Mark history as FAILED
     if (historyRecord) {
-      await prisma.compareHistory.update({
-        where: { id: historyRecord.id },
-        data: { status: 'FAILED', errorMessage: error.message, durationMs: Date.now() - startTime },
-      }).catch(() => {});
+      await execute(
+        'UPDATE compare_history SET status = ?, errorMessage = ?, durationMs = ?, updatedAt = NOW() WHERE id = ?',
+        ['FAILED', error.message, Date.now() - startTime, historyRecord.id]
+      ).catch(() => {});
 
       await AuditService.log({
         organizationId: req.organizationId,
@@ -124,21 +112,27 @@ exports.compareProject = async (req, res, next) => {
 exports.getHistory = async (req, res, next) => {
   try {
     const { projectId, page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    const where = { organizationId: req.organizationId };
-    if (projectId) where.projectId = projectId;
+    let whereClause = 'ch.organizationId = ?';
+    const params = [req.organizationId];
 
-    const [records, total] = await Promise.all([
-      prisma.compareHistory.findMany({
-        where,
-        include: { project: { select: { projectName: true } } },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: parseInt(limit),
-      }),
-      prisma.compareHistory.count({ where }),
+    if (projectId) {
+      whereClause += ' AND ch.projectId = ?';
+      params.push(projectId);
+    }
+
+    const [records, countRows] = await Promise.all([
+      query(
+        `SELECT ch.*, p.projectName FROM compare_history ch
+         LEFT JOIN projects p ON ch.projectId = p.id
+         WHERE ${whereClause} ORDER BY ch.createdAt DESC LIMIT ? OFFSET ?`,
+        [...params, parseInt(limit), offset]
+      ),
+      query(`SELECT COUNT(*) as total FROM compare_history ch WHERE ${whereClause}`, params),
     ]);
+
+    const total = countRows[0].total;
 
     res.json({
       success: true,

@@ -1,10 +1,11 @@
-const { prisma } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const { query, execute } = require('../config/database');
 const { encrypt, decrypt } = require('../utils/encryption');
 const ExtractorService = require('../services/ExtractorService');
 const AppError = require('../utils/AppError');
 const AuditService = require('../services/AuditService');
 
-// ── Helper: strip decrypted passwords from response ──
+// ── Helper: strip encrypted passwords from response ──
 const safeProject = (project) => {
   const { sourcePasswordEncrypted, destPasswordEncrypted, ...safe } = project;
   return {
@@ -16,16 +17,16 @@ const safeProject = (project) => {
 
 exports.getAllProjects = async (req, res, next) => {
   try {
-    const projects = await prisma.project.findMany({
-      where: { organizationId: req.organizationId, isArchived: false },
-      include: { createdBy: { select: { firstName: true, lastName: true, email: true } } },
-      orderBy: { updatedAt: 'desc' },
-    });
+    const projects = await query(
+      `SELECT p.*, u.firstName, u.lastName, u.email as createdByEmail
+       FROM projects p
+       LEFT JOIN users u ON p.createdById = u.id
+       WHERE p.organizationId = ? AND p.isArchived = 0
+       ORDER BY p.updatedAt DESC`,
+      [req.organizationId]
+    );
 
-    res.json({
-      success: true,
-      data: projects.map(safeProject),
-    });
+    res.json({ success: true, data: projects.map(safeProject) });
   } catch (error) {
     next(error);
   }
@@ -33,12 +34,12 @@ exports.getAllProjects = async (req, res, next) => {
 
 exports.getProjectById = async (req, res, next) => {
   try {
-    const project = await prisma.project.findFirst({
-      where: { id: req.params.id, organizationId: req.organizationId },
-    });
-    if (!project) return next(new AppError('Project not found.', 404));
-
-    res.json({ success: true, data: safeProject(project) });
+    const projects = await query(
+      'SELECT * FROM projects WHERE id = ? AND organizationId = ?',
+      [req.params.id, req.organizationId]
+    );
+    if (!projects[0]) return next(new AppError('Project not found.', 404));
+    res.json({ success: true, data: safeProject(projects[0]) });
   } catch (error) {
     next(error);
   }
@@ -58,40 +59,39 @@ exports.createProject = async (req, res, next) => {
       return next(new AppError('Project name, source, and destination connection details are all required.', 400));
     }
 
-    const project = await prisma.project.create({
-      data: {
-        organizationId: req.organizationId,
-        createdById: req.user.id,
-        projectName,
-        description,
-        sourceHost,
-        sourcePort: sourcePort || 1433,
-        sourceDatabase,
-        sourceUsername,
-        sourcePasswordEncrypted: encrypt(sourcePassword),
-        sourceEncryptConnection: sourceEncryptConnection || false,
-        sourceTrustServerCert: sourceTrustServerCert !== false,
-        destHost,
-        destPort: destPort || 1433,
-        destDatabase,
-        destUsername,
-        destPasswordEncrypted: encrypt(destPassword),
-        destEncryptConnection: destEncryptConnection || false,
-        destTrustServerCert: destTrustServerCert !== false,
-      },
-    });
+    const id = uuidv4();
+    const now = new Date();
+
+    await execute(
+      `INSERT INTO projects (id, organizationId, createdById, projectName, description,
+        sourceHost, sourcePort, sourceDatabase, sourceUsername, sourcePasswordEncrypted,
+        sourceEncryptConnection, sourceTrustServerCert,
+        destHost, destPort, destDatabase, destUsername, destPasswordEncrypted,
+        destEncryptConnection, destTrustServerCert, isArchived, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [
+        id, req.organizationId, req.user.id, projectName, description || null,
+        sourceHost, sourcePort || 1433, sourceDatabase, sourceUsername, encrypt(sourcePassword),
+        sourceEncryptConnection ? 1 : 0, sourceTrustServerCert !== false ? 1 : 0,
+        destHost, destPort || 1433, destDatabase, destUsername, encrypt(destPassword),
+        destEncryptConnection ? 1 : 0, destTrustServerCert !== false ? 1 : 0,
+        now, now,
+      ]
+    );
+
+    const projects = await query('SELECT * FROM projects WHERE id = ?', [id]);
 
     await AuditService.log({
       organizationId: req.organizationId,
       userId: req.user.id,
       action: 'PROJECT_CREATED',
       entity: 'Project',
-      entityId: project.id,
+      entityId: id,
       description: `Project "${projectName}" created`,
       ipAddress: AuditService.getIpFromRequest(req),
     });
 
-    res.status(201).json({ success: true, message: 'Project created successfully.', data: safeProject(project) });
+    res.status(201).json({ success: true, message: 'Project created successfully.', data: safeProject(projects[0]) });
   } catch (error) {
     next(error);
   }
@@ -99,10 +99,12 @@ exports.createProject = async (req, res, next) => {
 
 exports.updateProject = async (req, res, next) => {
   try {
-    const existing = await prisma.project.findFirst({
-      where: { id: req.params.id, organizationId: req.organizationId },
-    });
-    if (!existing) return next(new AppError('Project not found.', 404));
+    const existingRows = await query(
+      'SELECT * FROM projects WHERE id = ? AND organizationId = ?',
+      [req.params.id, req.organizationId]
+    );
+    if (!existingRows[0]) return next(new AppError('Project not found.', 404));
+    const existing = existingRows[0];
 
     const {
       projectName, description,
@@ -112,26 +114,36 @@ exports.updateProject = async (req, res, next) => {
       destEncryptConnection, destTrustServerCert,
     } = req.body;
 
-    const updateData = {
-      projectName: projectName ?? existing.projectName,
-      description: description ?? existing.description,
-      sourceHost: sourceHost ?? existing.sourceHost,
-      sourcePort: sourcePort ?? existing.sourcePort,
-      sourceDatabase: sourceDatabase ?? existing.sourceDatabase,
-      sourceUsername: sourceUsername ?? existing.sourceUsername,
-      sourcePasswordEncrypted: sourcePassword ? encrypt(sourcePassword) : existing.sourcePasswordEncrypted,
-      sourceEncryptConnection: sourceEncryptConnection ?? existing.sourceEncryptConnection,
-      sourceTrustServerCert: sourceTrustServerCert ?? existing.sourceTrustServerCert,
-      destHost: destHost ?? existing.destHost,
-      destPort: destPort ?? existing.destPort,
-      destDatabase: destDatabase ?? existing.destDatabase,
-      destUsername: destUsername ?? existing.destUsername,
-      destPasswordEncrypted: destPassword ? encrypt(destPassword) : existing.destPasswordEncrypted,
-      destEncryptConnection: destEncryptConnection ?? existing.destEncryptConnection,
-      destTrustServerCert: destTrustServerCert ?? existing.destTrustServerCert,
-    };
+    await execute(
+      `UPDATE projects SET
+        projectName = ?, description = ?,
+        sourceHost = ?, sourcePort = ?, sourceDatabase = ?, sourceUsername = ?, sourcePasswordEncrypted = ?,
+        sourceEncryptConnection = ?, sourceTrustServerCert = ?,
+        destHost = ?, destPort = ?, destDatabase = ?, destUsername = ?, destPasswordEncrypted = ?,
+        destEncryptConnection = ?, destTrustServerCert = ?, updatedAt = NOW()
+       WHERE id = ?`,
+      [
+        projectName ?? existing.projectName,
+        description ?? existing.description,
+        sourceHost ?? existing.sourceHost,
+        sourcePort ?? existing.sourcePort,
+        sourceDatabase ?? existing.sourceDatabase,
+        sourceUsername ?? existing.sourceUsername,
+        sourcePassword ? encrypt(sourcePassword) : existing.sourcePasswordEncrypted,
+        (sourceEncryptConnection ?? existing.sourceEncryptConnection) ? 1 : 0,
+        (sourceTrustServerCert ?? existing.sourceTrustServerCert) ? 1 : 0,
+        destHost ?? existing.destHost,
+        destPort ?? existing.destPort,
+        destDatabase ?? existing.destDatabase,
+        destUsername ?? existing.destUsername,
+        destPassword ? encrypt(destPassword) : existing.destPasswordEncrypted,
+        (destEncryptConnection ?? existing.destEncryptConnection) ? 1 : 0,
+        (destTrustServerCert ?? existing.destTrustServerCert) ? 1 : 0,
+        existing.id,
+      ]
+    );
 
-    const updated = await prisma.project.update({ where: { id: existing.id }, data: updateData });
+    const updated = await query('SELECT * FROM projects WHERE id = ?', [existing.id]);
 
     await AuditService.log({
       organizationId: req.organizationId,
@@ -139,10 +151,10 @@ exports.updateProject = async (req, res, next) => {
       action: 'PROJECT_UPDATED',
       entity: 'Project',
       entityId: existing.id,
-      description: `Project "${updated.projectName}" updated`,
+      description: `Project "${updated[0].projectName}" updated`,
     });
 
-    res.json({ success: true, message: 'Project updated.', data: safeProject(updated) });
+    res.json({ success: true, message: 'Project updated.', data: safeProject(updated[0]) });
   } catch (error) {
     next(error);
   }
@@ -150,12 +162,14 @@ exports.updateProject = async (req, res, next) => {
 
 exports.deleteProject = async (req, res, next) => {
   try {
-    const project = await prisma.project.findFirst({
-      where: { id: req.params.id, organizationId: req.organizationId },
-    });
-    if (!project) return next(new AppError('Project not found.', 404));
+    const projects = await query(
+      'SELECT * FROM projects WHERE id = ? AND organizationId = ?',
+      [req.params.id, req.organizationId]
+    );
+    if (!projects[0]) return next(new AppError('Project not found.', 404));
+    const project = projects[0];
 
-    await prisma.project.delete({ where: { id: project.id } });
+    await execute('DELETE FROM projects WHERE id = ?', [project.id]);
 
     await AuditService.log({
       organizationId: req.organizationId,
@@ -178,10 +192,12 @@ exports.testConnection = async (req, res, next) => {
     let config;
 
     if (projectId) {
-      const project = await prisma.project.findFirst({
-        where: { id: projectId, organizationId: req.organizationId },
-      });
-      if (!project) return next(new AppError('Project not found.', 404));
+      const projects = await query(
+        'SELECT * FROM projects WHERE id = ? AND organizationId = ?',
+        [projectId, req.organizationId]
+      );
+      if (!projects[0]) return next(new AppError('Project not found.', 404));
+      const project = projects[0];
 
       if (type === 'source') {
         config = {

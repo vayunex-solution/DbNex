@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { prisma } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const { query, execute } = require('../config/database');
 const AppError = require('../utils/AppError');
 const AuditService = require('../services/AuditService');
 
@@ -17,35 +18,31 @@ const generateTokens = (userId) => {
 exports.login = async (req, res, next) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return next(new AppError('Email and password are required.', 400));
-    }
+    if (!email || !password) return next(new AppError('Email and password are required.', 400));
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase().trim() },
-      include: { organization: true },
-    });
+    const users = await query(
+      'SELECT u.*, o.id as org_id, o.name as org_name, o.slug as org_slug, o.plan as org_plan FROM users u LEFT JOIN organizations o ON u.organizationId = o.id WHERE u.email = ?',
+      [email.toLowerCase().trim()]
+    );
+    const user = users[0];
 
-    if (!user || !user.isActive) {
-      return next(new AppError('Invalid credentials.', 401));
-    }
+    if (!user || !user.isActive) return next(new AppError('Invalid credentials.', 401));
 
     const passwordMatch = await bcrypt.compare(password, user.passwordHash);
-    if (!passwordMatch) {
-      return next(new AppError('Invalid credentials.', 401));
-    }
+    if (!passwordMatch) return next(new AppError('Invalid credentials.', 401));
 
     const { accessToken, refreshToken } = generateTokens(user.id);
 
-    // Store refresh token
+    const tokenId = uuidv4();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 30);
-    await prisma.refreshToken.create({ data: { token: refreshToken, userId: user.id, expiresAt } });
+    await execute(
+      'INSERT INTO refresh_tokens (id, token, userId, expiresAt) VALUES (?, ?, ?, ?)',
+      [tokenId, refreshToken, user.id, expiresAt]
+    );
 
-    // Update last login
-    await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+    await execute('UPDATE users SET lastLoginAt = NOW() WHERE id = ?', [user.id]);
 
-    // Audit
     await AuditService.log({
       organizationId: user.organizationId,
       userId: user.id,
@@ -71,10 +68,10 @@ exports.login = async (req, res, next) => {
           role: user.role,
           avatar: user.avatar,
           organization: {
-            id: user.organization.id,
-            name: user.organization.name,
-            slug: user.organization.slug,
-            plan: user.organization.plan,
+            id: user.org_id,
+            name: user.org_name,
+            slug: user.org_slug,
+            plan: user.org_plan,
           },
         },
       },
@@ -96,26 +93,28 @@ exports.refreshToken = async (req, res, next) => {
       return next(new AppError('Invalid or expired refresh token.', 401));
     }
 
-    const storedToken = await prisma.refreshToken.findFirst({
-      where: { token: refreshToken, userId: decoded.userId },
-    });
+    const tokens = await query(
+      'SELECT * FROM refresh_tokens WHERE token = ? AND userId = ?',
+      [refreshToken, decoded.userId]
+    );
+    const storedToken = tokens[0];
 
-    if (!storedToken || storedToken.expiresAt < new Date()) {
+    if (!storedToken || new Date(storedToken.expiresAt) < new Date()) {
       return next(new AppError('Refresh token is invalid or expired.', 401));
     }
 
     const { accessToken, refreshToken: newRefreshToken } = generateTokens(decoded.userId);
+    await execute('DELETE FROM refresh_tokens WHERE id = ?', [storedToken.id]);
 
-    // Rotate refresh token
-    await prisma.refreshToken.delete({ where: { id: storedToken.id } });
+    const tokenId = uuidv4();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 30);
-    await prisma.refreshToken.create({ data: { token: newRefreshToken, userId: decoded.userId, expiresAt } });
+    await execute(
+      'INSERT INTO refresh_tokens (id, token, userId, expiresAt) VALUES (?, ?, ?, ?)',
+      [tokenId, newRefreshToken, decoded.userId, expiresAt]
+    );
 
-    res.json({
-      success: true,
-      data: { accessToken, refreshToken: newRefreshToken },
-    });
+    res.json({ success: true, data: { accessToken, refreshToken: newRefreshToken } });
   } catch (error) {
     next(error);
   }
@@ -125,7 +124,7 @@ exports.logout = async (req, res, next) => {
   try {
     const { refreshToken } = req.body;
     if (refreshToken) {
-      await prisma.refreshToken.deleteMany({ where: { token: refreshToken } });
+      await execute('DELETE FROM refresh_tokens WHERE token = ?', [refreshToken]);
     }
 
     await AuditService.log({
@@ -171,15 +170,14 @@ exports.changePassword = async (req, res, next) => {
     if (!currentPassword || !newPassword) return next(new AppError('Current and new passwords are required.', 400));
     if (newPassword.length < 8) return next(new AppError('Password must be at least 8 characters.', 400));
 
-    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+    const users = await query('SELECT * FROM users WHERE id = ?', [req.user.id]);
+    const user = users[0];
     const isValid = await bcrypt.compare(currentPassword, user.passwordHash);
     if (!isValid) return next(new AppError('Current password is incorrect.', 400));
 
     const newHash = await bcrypt.hash(newPassword, 12);
-    await prisma.user.update({ where: { id: req.user.id }, data: { passwordHash: newHash } });
-
-    // Invalidate all refresh tokens
-    await prisma.refreshToken.deleteMany({ where: { userId: req.user.id } });
+    await execute('UPDATE users SET passwordHash = ? WHERE id = ?', [newHash, req.user.id]);
+    await execute('DELETE FROM refresh_tokens WHERE userId = ?', [req.user.id]);
 
     res.json({ success: true, message: 'Password changed successfully. Please log in again.' });
   } catch (error) {

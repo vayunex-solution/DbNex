@@ -1,31 +1,39 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate, authorize } = require('../middleware/auth.middleware');
-const { prisma } = require('../config/database');
+const { query } = require('../config/database');
 
 router.use(authenticate);
 
-// Only admins and owners can view audit logs
 router.get('/', authorize('OWNER', 'ADMIN'), async (req, res, next) => {
   try {
     const { page = 1, limit = 50, action, userId } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    const where = { organizationId: req.organizationId };
-    if (action) where.action = action;
-    if (userId) where.userId = userId;
+    let whereClause = 'al.organizationId = ?';
+    const params = [req.organizationId];
 
-    const [logs, total] = await Promise.all([
-      prisma.auditLog.findMany({
-        where,
-        include: { user: { select: { firstName: true, lastName: true, email: true } } },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: parseInt(limit),
-      }),
-      prisma.auditLog.count({ where }),
+    if (action) {
+      whereClause += ' AND al.action = ?';
+      params.push(action);
+    }
+    if (userId) {
+      whereClause += ' AND al.userId = ?';
+      params.push(userId);
+    }
+
+    const [logs, countRows] = await Promise.all([
+      query(
+        `SELECT al.*, u.firstName, u.lastName, u.email as userEmail
+         FROM audit_logs al
+         LEFT JOIN users u ON al.userId = u.id
+         WHERE ${whereClause} ORDER BY al.createdAt DESC LIMIT ? OFFSET ?`,
+        [...params, parseInt(limit), offset]
+      ),
+      query(`SELECT COUNT(*) as total FROM audit_logs al WHERE ${whereClause}`, params),
     ]);
 
+    const total = countRows[0].total;
     res.json({
       success: true,
       data: logs,

@@ -1,4 +1,5 @@
-const { prisma } = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
+const { query, execute } = require('../config/database');
 const { decrypt } = require('../utils/encryption');
 const ScriptRunnerService = require('../services/ScriptRunnerService');
 const RiskAnalyzerService = require('../services/RiskAnalyzerService');
@@ -9,7 +10,6 @@ exports.analyzeScript = async (req, res, next) => {
   try {
     const { scriptSql } = req.body;
     if (!scriptSql?.trim()) return next(new AppError('scriptSql is required.', 400));
-
     const riskReport = RiskAnalyzerService.analyze(scriptSql);
     res.json({ success: true, data: riskReport });
   } catch (error) {
@@ -23,20 +23,19 @@ exports.executeScript = async (req, res, next) => {
 
   try {
     const { projectId, scriptSql, compareHistoryId, confirmed } = req.body;
-
     if (!projectId || !scriptSql?.trim()) {
       return next(new AppError('projectId and scriptSql are required.', 400));
     }
 
-    const project = await prisma.project.findFirst({
-      where: { id: projectId, organizationId: req.organizationId },
-    });
-    if (!project) return next(new AppError('Project not found.', 404));
+    const projects = await query(
+      'SELECT * FROM projects WHERE id = ? AND organizationId = ?',
+      [projectId, req.organizationId]
+    );
+    if (!projects[0]) return next(new AppError('Project not found.', 404));
+    const project = projects[0];
 
-    // Always run risk analysis first
     const riskReport = RiskAnalyzerService.analyze(scriptSql);
 
-    // Enforce confirmation for Medium/High risk scripts
     if (riskReport.requiresConfirmation && !confirmed) {
       return res.status(200).json({
         success: false,
@@ -46,7 +45,6 @@ exports.executeScript = async (req, res, next) => {
       });
     }
 
-    // Build destination config (we execute AGAINST destination)
     const destConfig = {
       host: project.destHost,
       port: project.destPort,
@@ -57,36 +55,33 @@ exports.executeScript = async (req, res, next) => {
       trustServerCert: project.destTrustServerCert,
     };
 
-    // Create execution log record
-    logRecord = await prisma.executionLog.create({
-      data: {
-        organizationId: req.organizationId,
-        projectId: project.id,
-        compareHistoryId: compareHistoryId || null,
-        status: 'RUNNING',
-        scriptSql,
-        riskLevel: riskReport.overallRisk,
-      },
-    });
+    const logId = uuidv4();
+    const now = new Date();
+    await execute(
+      `INSERT INTO execution_logs (id, organizationId, projectId, compareHistoryId, status, scriptSql, riskLevel, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?)`,
+      [logId, req.organizationId, project.id, compareHistoryId || null, scriptSql, riskReport.overallRisk, now, now]
+    );
+    logRecord = { id: logId };
 
-    // Execute the script
     const execResult = await ScriptRunnerService.executeScript(destConfig, scriptSql);
     const durationMs = Date.now() - startTime;
 
-    // Update execution log
-    await prisma.executionLog.update({
-      where: { id: logRecord.id },
-      data: {
-        status: execResult.status,
-        totalBatches: execResult.totalBatches,
-        successBatches: execResult.successBatches,
-        failedBatches: execResult.failedBatches,
-        batchLogs: execResult.batchLogs,
-        errorMessage: execResult.failedBatches > 0 ? `${execResult.failedBatches} batch(es) failed.` : null,
+    await execute(
+      `UPDATE execution_logs SET status = ?, totalBatches = ?, successBatches = ?, failedBatches = ?,
+       batchLogs = ?, errorMessage = ?, durationMs = ?, executedAt = NOW(), updatedAt = NOW()
+       WHERE id = ?`,
+      [
+        execResult.status,
+        execResult.totalBatches,
+        execResult.successBatches,
+        execResult.failedBatches,
+        JSON.stringify(execResult.batchLogs),
+        execResult.failedBatches > 0 ? `${execResult.failedBatches} batch(es) failed.` : null,
         durationMs,
-        executedAt: new Date(),
-      },
-    });
+        logId,
+      ]
+    );
 
     const auditAction = execResult.success ? 'SCRIPT_EXECUTED' : 'SCRIPT_FAILED';
     await AuditService.log({
@@ -94,25 +89,18 @@ exports.executeScript = async (req, res, next) => {
       userId: req.user.id,
       action: auditAction,
       entity: 'ExecutionLog',
-      entityId: logRecord.id,
+      entityId: logId,
       description: `Script execution ${execResult.status.toLowerCase()} for project "${project.projectName}" — ${execResult.successBatches}/${execResult.totalBatches} batches succeeded`,
       metadata: { riskLevel: riskReport.overallRisk, durationMs },
     });
 
-    res.json({
-      success: execResult.success,
-      data: {
-        executionLogId: logRecord.id,
-        ...execResult,
-        riskReport,
-      },
-    });
+    res.json({ success: execResult.success, data: { executionLogId: logId, ...execResult, riskReport } });
   } catch (error) {
     if (logRecord) {
-      await prisma.executionLog.update({
-        where: { id: logRecord.id },
-        data: { status: 'FAILED', errorMessage: error.message, durationMs: Date.now() - startTime, executedAt: new Date() },
-      }).catch(() => {});
+      await execute(
+        'UPDATE execution_logs SET status = ?, errorMessage = ?, durationMs = ?, executedAt = NOW(), updatedAt = NOW() WHERE id = ?',
+        ['FAILED', error.message, Date.now() - startTime, logRecord.id]
+      ).catch(() => {});
     }
     next(error);
   }
@@ -121,27 +109,30 @@ exports.executeScript = async (req, res, next) => {
 exports.getExecutionLogs = async (req, res, next) => {
   try {
     const { projectId, page = 1, limit = 20 } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    const where = { organizationId: req.organizationId };
-    if (projectId) where.projectId = projectId;
+    let whereClause = 'el.organizationId = ?';
+    const params = [req.organizationId];
 
-    const [logs, total] = await Promise.all([
-      prisma.executionLog.findMany({
-        where,
-        include: { project: { select: { projectName: true } } },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: parseInt(limit),
-        select: {
-          id: true, status: true, riskLevel: true, totalBatches: true,
-          successBatches: true, failedBatches: true, durationMs: true,
-          executedAt: true, createdAt: true, errorMessage: true,
-          project: { select: { projectName: true } },
-        },
-      }),
-      prisma.executionLog.count({ where }),
+    if (projectId) {
+      whereClause += ' AND el.projectId = ?';
+      params.push(projectId);
+    }
+
+    const [logs, countRows] = await Promise.all([
+      query(
+        `SELECT el.id, el.status, el.riskLevel, el.totalBatches, el.successBatches,
+                el.failedBatches, el.durationMs, el.executedAt, el.createdAt, el.errorMessage,
+                p.projectName
+         FROM execution_logs el
+         LEFT JOIN projects p ON el.projectId = p.id
+         WHERE ${whereClause} ORDER BY el.createdAt DESC LIMIT ? OFFSET ?`,
+        [...params, parseInt(limit), offset]
+      ),
+      query(`SELECT COUNT(*) as total FROM execution_logs el WHERE ${whereClause}`, params),
     ]);
+
+    const total = countRows[0].total;
 
     res.json({
       success: true,
@@ -155,12 +146,14 @@ exports.getExecutionLogs = async (req, res, next) => {
 
 exports.getExecutionLogById = async (req, res, next) => {
   try {
-    const log = await prisma.executionLog.findFirst({
-      where: { id: req.params.id, organizationId: req.organizationId },
-      include: { project: { select: { projectName: true } } },
-    });
-    if (!log) return next(new AppError('Execution log not found.', 404));
-    res.json({ success: true, data: log });
+    const logs = await query(
+      `SELECT el.*, p.projectName FROM execution_logs el
+       LEFT JOIN projects p ON el.projectId = p.id
+       WHERE el.id = ? AND el.organizationId = ?`,
+      [req.params.id, req.organizationId]
+    );
+    if (!logs[0]) return next(new AppError('Execution log not found.', 404));
+    res.json({ success: true, data: logs[0] });
   } catch (error) {
     next(error);
   }

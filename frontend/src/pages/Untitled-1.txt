@@ -1,0 +1,1 @@
+{"status":"healthy","app":"DbNex API","vendor":"Vayunex Solution","version":"1.0.0","timestamp":"2026-06-20T11:28:22.188Z","environment":"production"}
