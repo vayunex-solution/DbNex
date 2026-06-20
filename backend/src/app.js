@@ -92,6 +92,10 @@ async function startServer() {
     await prisma.$connect();
     logger.info('✅ MySQL database connected via Prisma');
 
+    // Warm up Prisma binary to avoid cold-start timeout on first request
+    await prisma.$queryRaw`SELECT 1`;
+    logger.info('✅ Prisma engine warmed up');
+
     app.listen(PORT, () => {
       logger.info(`🚀 DbNex API running on port ${PORT}`);
       logger.info(`   Environment : ${process.env.NODE_ENV}`);
